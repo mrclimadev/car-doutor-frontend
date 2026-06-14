@@ -1,5 +1,61 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 import { jsPDF } from 'jspdf'
+
+/* ── WhatsApp share ──────────────────────────────────────────────────────── */
+// Apenas emojis BMP (U+0000–U+FFFF) — wa.me não suporta code points acima de U+FFFF
+const E = {
+  check:  '✅',        // ✅
+  warn:   '⚠️',  // ⚠️
+  crit:   '❗',        // ❗
+  scales: '⚖️',  // ⚖️
+  pin:    '▶️',  // ▶️
+  bullet: '•',        // •
+}
+
+function buildWhatsAppText(laudo) {
+  const ST_LABEL = {
+    ok:      `${E.check} CONFORME`,
+    atencao: `${E.warn} ATENÇÃO`,
+    critico: `${E.crit} CRÍTICO`,
+  }
+  const appOk  = (laudo.app?.deficit_ha || 0) <= 0
+  const rlOk   = (laudo.rl?.percentual_declarado || 0) >= (laudo.rl?.percentual_minimo || 20)
+  const alertas = (laudo.desmatamento?.alertas_prodes || 0) + (laudo.desmatamento?.alertas_deter || 0)
+  const restOk = !laudo.restricoes?.sobreposicao_ti && !laudo.restricoes?.sobreposicao_uc
+
+  const resumo = (laudo.resumo_simples || '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/#{1,3}\s+/g, '')
+    .replace(/^[-*]\s/gm, '• ')
+    .trim()
+
+  return [
+    `*CAR Doutor — Análise do Imóvel*`,
+    '',
+    `${E.pin} *${laudo.municipio || 'Mato Grosso'} · MT*`,
+    `Área: *${(laudo.area_imovel_ha || 0).toFixed(0)} ha*`,
+    laudo.car_code ? `CAR: ${laudo.car_code}` : null,
+    '',
+    `*Resultado: ${ST_LABEL[laudo.status_geral] || '—'}*`,
+    '',
+    resumo,
+    '',
+    '───────────────',
+    `${E.bullet} APP: ${appOk ? `${E.check} dentro do limite` : `${E.warn} déficit ${(laudo.app?.deficit_ha || 0).toFixed(1)} ha`}`,
+    `${E.bullet} RL: ${rlOk ? `${E.check} ${(laudo.rl?.percentual_declarado || 0).toFixed(0)}%` : `${E.warn} ${(laudo.rl?.percentual_declarado || 0).toFixed(0)}% (mín ${(laudo.rl?.percentual_minimo || 0).toFixed(0)}%)`}`,
+    `${E.bullet} Desmatamento: ${alertas === 0 ? `${E.check} sem alertas` : `${E.warn} ${alertas} alertas`}`,
+    `${E.scales} Restrições: ${restOk ? `${E.check} sem sobreposição` : `${E.crit} área sobreposta`}`,
+    '',
+    laudo.total_pendencias > 0
+      ? `${E.bullet} ${laudo.total_pendencias} pendência${laudo.total_pendencias > 1 ? 's' : ''} identificada${laudo.total_pendencias > 1 ? 's' : ''}`
+      : `${E.check} Nenhuma pendência encontrada`,
+    '',
+    '_Análise automática — CAR Doutor (ENAP Hackathon 2026)_',
+    '_Não substitui laudo técnico assinado por profissional habilitado._',
+  ].filter(p => p !== null).join('\n')
+}
 
 /* ── Markdown renderer ───────────────────────────────────────────────────── */
 function inlineMd(text) {
@@ -225,7 +281,27 @@ function exportPDF(laudo) {
   const allP = [
     ...laudo.app.pendencias, ...laudo.rl.pendencias,
     ...laudo.desmatamento.pendencias, ...laudo.restricoes.pendencias,
+    ...(laudo.land_use?.pendencias ?? []),
   ]
+
+  if (laudo.land_use) {
+    const lu = laudo.land_use
+    secHd('Camadas SICAR — Uso do Solo', lu.status)
+    if (lu.rl_polygon_encontrado)
+      kv('RL Poligonal (SICAR)', `${lu.rl_polygon_ha.toFixed(1)} ha`)
+    if (lu.area_consolidada_ha > 0)
+      kv('Área Consolidada', `${lu.area_consolidada_ha.toFixed(1)} ha`)
+    if (lu.pra_elegivel_ha > 0)
+      kv('Elegível ao PRA (APP consolidada)', `~${lu.pra_elegivel_ha.toFixed(1)} ha`, 'warn')
+    if (lu.uso_restrito_ha > 0)
+      kv('Uso Restrito (art. 9°)', `${lu.uso_restrito_ha.toFixed(1)} ha`, 'warn')
+    if (lu.area_pousio_ha > 0)
+      kv('Área de Pousio', `${lu.area_pousio_ha.toFixed(1)} ha`)
+    if (lu.servidao_ha > 0)
+      kv('Servidão Administrativa', `${lu.servidao_ha.toFixed(1)} ha`, 'warn')
+    y += 5
+  }
+
   secHd(`Pendencias (${allP.length})`)
   if (allP.length === 0) {
     doc.setFontSize(9.5)
@@ -330,6 +406,250 @@ function exportPDF(laudo) {
   doc.save(fname)
 }
 
+/* ── Land use composition helpers ───────────────────────────────────────── */
+function LandUseBar({ laudo }) {
+  const total = laudo.area_imovel_ha || 1
+  const lu = laudo.land_use || {}
+  const app = laudo.app?.area_declarada_ha || 0
+
+  // RL: use polygon if found, else declared
+  const rl = lu.rl_polygon_encontrado ? lu.rl_polygon_ha : laudo.rl?.area_declarada_ha || 0
+  const consolidated = lu.area_consolidada_ha || 0
+  const restrito = lu.uso_restrito_ha || 0
+  const pousio = lu.area_pousio_ha || 0
+  const serv = lu.servidao_ha || 0
+
+  // Overlap-aware segments (simplified: sum capped at total)
+  const used = Math.min(rl + app + restrito + pousio + serv, total)
+  const productive = Math.max(0, total - used)
+
+  const segs = [
+    { key: 'rl',   pct: (rl / total) * 100,          color: '#1b5e20', label: 'RL' },
+    { key: 'app',  pct: (app / total) * 100,          color: '#1565c0', label: 'APP' },
+    { key: 'ur',   pct: (restrito / total) * 100,     color: '#f5a623', label: 'Uso Restrito' },
+    { key: 'po',   pct: (pousio / total) * 100,       color: '#d4c200', label: 'Pousio' },
+    { key: 'sv',   pct: (serv / total) * 100,         color: '#7b1fa2', label: 'Servidão' },
+    { key: 'pr',   pct: (productive / total) * 100,   color: '#2d4a1e', label: 'Produtiva' },
+  ].filter(s => s.pct > 0.5)
+
+  return (
+    <div className="lu-bar-wrap">
+      <div className="lu-bar">
+        {segs.map(s => (
+          <div key={s.key} className="lu-bar-seg" style={{ width: `${Math.min(s.pct, 100)}%`, background: s.color }}
+               title={`${s.label}: ${s.pct.toFixed(1)}%`} />
+        ))}
+      </div>
+      <div className="lu-bar-legend">
+        {segs.map(s => (
+          <div key={s.key} className="lu-legend-item">
+            <div className="lu-legend-dot" style={{ background: s.color }} />
+            <span>{s.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function LuMetric({ icon, label, value, sub, status }) {
+  return (
+    <div className={`lu-metric lu-metric--${status}`}>
+      <div className="lu-metric-icon">{icon}</div>
+      <div className="lu-metric-body">
+        <div className="lu-metric-label">{label}</div>
+        <div className={`lu-metric-value ${status}`}>{value}</div>
+        {sub && <div className="lu-metric-sub">{sub}</div>}
+      </div>
+    </div>
+  )
+}
+
+/* ── Simulador "E se eu regularizar?" ───────────────────────────────────── */
+const CARBONO_FACTOR = { 'Amazônia Legal': 10, 'Cerrado (Amazônia Legal)': 5, 'Cerrado': 3, 'Caatinga': 3, 'Pantanal': 4, 'Pampa': 3 }
+const PRECO_CARBONO_R = 45  // R$/tCO2e mercado voluntário estimado
+
+function SimuladorCard({ laudo }) {
+  const bioma     = laudo.rl?.bioma || 'Cerrado'
+  const totalHa   = laudo.area_imovel_ha || 0
+  const atualPct  = laudo.rl?.percentual_declarado || 0
+  const minPct    = laudo.rl?.percentual_minimo || 20
+  const deficitHa = Math.max(0, laudo.rl?.area_minima_ha - laudo.rl?.area_declarada_ha)
+  const appDefHa  = laudo.app?.deficit_ha || 0
+  const temDeficit = deficitHa > 0.5 || appDefHa > 0.5
+
+  const maxPct  = Math.min(100, Math.max(minPct + 20, atualPct + 30))
+  const [alvo, setAlvo] = useState(() => Math.min(maxPct, Math.max(minPct, atualPct + (deficitHa > 0 ? (deficitHa / totalHa) * 100 : 5))))
+
+  const areaAdicional = Math.max(0, (alvo - atualPct) / 100 * totalHa)
+  const fator         = CARBONO_FACTOR[bioma] || 4
+  const co2Ano        = areaAdicional * fator
+  const receitaAno    = co2Ano * PRECO_CARBONO_R
+  const praElegivel   = temDeficit && (laudo.cadastro?.mod_fiscal == null || laudo.cadastro.mod_fiscal <= 15)
+  const creditoLibera = alvo >= minPct && (laudo.app?.deficit_ha || 0) < 0.5
+
+  return (
+    <div className="simul-card">
+      <div className="prod-section-lbl" style={{ marginBottom: 10 }}>
+        Simulador — E se eu regularizar?
+      </div>
+
+      <div className="simul-slider-row">
+        <span className="simul-slider-lbl">Meta de Reserva Legal</span>
+        <span className="simul-slider-val">{alvo.toFixed(0)}%</span>
+      </div>
+      <input
+        type="range" className="simul-range"
+        min={Math.max(0, atualPct)} max={maxPct} step={1}
+        value={alvo} onChange={e => setAlvo(Number(e.target.value))}
+      />
+      <div className="simul-range-labels">
+        <span>Atual: {atualPct.toFixed(0)}%</span>
+        <span className={atualPct >= minPct ? 'good' : 'warn'}>Mín: {minPct.toFixed(0)}%</span>
+        <span>Meta: {alvo.toFixed(0)}%</span>
+      </div>
+
+      <div className="simul-grid">
+        <div className="simul-item">
+          <div className="simul-item-icon">🌿</div>
+          <div className="simul-item-val good">{areaAdicional.toFixed(1)} ha</div>
+          <div className="simul-item-lbl">área a recuperar</div>
+        </div>
+        <div className="simul-item">
+          <div className="simul-item-icon">☁️</div>
+          <div className="simul-item-val good">{co2Ano.toFixed(0)} tCO₂e</div>
+          <div className="simul-item-lbl">carbono/ano ({bioma.split(' ')[0]})</div>
+        </div>
+        <div className="simul-item">
+          <div className="simul-item-icon">💰</div>
+          <div className="simul-item-val good">
+            {receitaAno >= 1000
+              ? `R$ ${(receitaAno / 1000).toFixed(1)}k`
+              : `R$ ${receitaAno.toFixed(0)}`}
+          </div>
+          <div className="simul-item-lbl">receita estimada/ano</div>
+        </div>
+      </div>
+
+      <div className="simul-badges">
+        <div className={`simul-badge ${alvo >= minPct ? 'simul-badge--ok' : 'simul-badge--no'}`}>
+          {alvo >= minPct ? '✓' : '✗'} Pronaf / Crédito Rural
+        </div>
+        <div className={`simul-badge ${praElegivel ? 'simul-badge--ok' : 'simul-badge--no'}`}>
+          {praElegivel ? '✓' : '—'} Elegível ao PRA
+        </div>
+        <div className={`simul-badge ${creditoLibera ? 'simul-badge--ok' : 'simul-badge--no'}`}>
+          {creditoLibera ? '✓' : '✗'} CAR regularizado
+        </div>
+      </div>
+      <div className="simul-disclaimer">
+        * Estimativa baseada em dados de mercado voluntário de carbono (VCM). Não constitui oferta de crédito.
+      </div>
+    </div>
+  )
+}
+
+/* ── Comparação com vizinhança ───────────────────────────────────────────── */
+function VizinhancaCard({ laudo }) {
+  const [stats, setStats]     = useState(null)
+  const [loading, setLoading] = useState(false)
+  const municipio = laudo.municipio
+
+  useEffect(() => {
+    if (!municipio) return
+    setLoading(true)
+    fetch(`${API_BASE}/stats/municipio/${encodeURIComponent(municipio)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { setStats(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [municipio])
+
+  if (!municipio) return null
+
+  const mfProp = laudo.cadastro?.mod_fiscal
+  const mfMun  = stats?.media_modulos_fiscais
+  const confProp = laudo.status_geral === 'ok' ? 100 : laudo.status_geral === 'atencao' ? 50 : 0
+
+  return (
+    <div className="vizin-card">
+      <div className="prod-section-lbl" style={{ marginBottom: 10 }}>
+        Contexto regional — {municipio}
+      </div>
+
+      {loading && <div className="vizin-loading">Carregando dados do município...</div>}
+
+      {stats && (
+        <>
+          <div className="vizin-grid">
+            <div className="vizin-item">
+              <div className="vizin-bar-wrap">
+                <div className="vizin-bar-track">
+                  <div className="vizin-bar-fill vizin-bar--mun" style={{ width: `${stats.pct_conforme}%` }} />
+                </div>
+                <div className="vizin-bar-track">
+                  <div
+                    className={`vizin-bar-fill ${confProp === 100 ? 'vizin-bar--ok' : confProp === 50 ? 'vizin-bar--warn' : 'vizin-bar--crit'}`}
+                    style={{ width: `${confProp}%` }}
+                  />
+                </div>
+              </div>
+              <div className="vizin-row-labels">
+                <span className="vizin-lbl-mun">{stats.pct_conforme}% em conformidade no município</span>
+                <span className={`vizin-lbl-prop ${laudo.status_geral}`}>
+                  Este imóvel: {laudo.status_geral === 'ok' ? 'conforme' : laudo.status_geral === 'atencao' ? 'atenção' : 'irregular'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="vizin-stats">
+            <div className="vizin-stat">
+              <div className="vizin-stat-val">{stats.total_imoveis.toLocaleString('pt-BR')}</div>
+              <div className="vizin-stat-lbl">imóveis em {municipio}</div>
+            </div>
+            {mfMun != null && (
+              <div className="vizin-stat">
+                <div className="vizin-stat-val">{mfMun.toFixed(1)} MF</div>
+                <div className="vizin-stat-lbl">média do município</div>
+              </div>
+            )}
+            {mfProp != null && (
+              <div className="vizin-stat">
+                <div className={`vizin-stat-val ${mfProp <= mfMun ? 'warn' : 'good'}`}>
+                  {mfProp.toFixed(1)} MF
+                </div>
+                <div className="vizin-stat-lbl">sua propriedade</div>
+              </div>
+            )}
+            <div className="vizin-stat">
+              <div className={`vizin-stat-val ${stats.pct_ativo >= 80 ? 'good' : 'warn'}`}>
+                {stats.pct_ativo}%
+              </div>
+              <div className="vizin-stat-lbl">CARs ativos</div>
+            </div>
+          </div>
+
+          {stats.porte_distribuicao && (
+            <div className="vizin-porte">
+              {Object.entries({ minifundio: 'Minifúndio', pequena: 'Pequena', media: 'Média', grande: 'Grande' })
+                .filter(([k]) => stats.porte_distribuicao[k] > 0)
+                .map(([k, label]) => {
+                  const pct = Math.round(stats.porte_distribuicao[k] / stats.total_imoveis * 100)
+                  return (
+                    <div key={k} className="vizin-porte-item">
+                      <div className="vizin-porte-bar" style={{ width: `${pct}%` }} />
+                      <span className="vizin-porte-lbl">{label} {pct}%</span>
+                    </div>
+                  )
+                })}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 /* ── Aba Produtor ────────────────────────────────────────────────────────── */
 function ProducerTab({ laudo, allP }) {
   const appOk = laudo.app.deficit_ha <= 0
@@ -396,6 +716,12 @@ function ProducerTab({ laudo, allP }) {
               </div>
             ))}
           </div>
+
+          {/* Simulador de regularização */}
+          <SimuladorCard laudo={laudo} />
+
+          {/* Comparação com vizinhança */}
+          <VizinhancaCard laudo={laudo} />
 
           {/* Solo amigável */}
           {laudo.solo?.disponivel && (
@@ -519,6 +845,7 @@ function ProducerTab({ laudo, allP }) {
 
 /* ── Aba Analista ────────────────────────────────────────────────────────── */
 function AnalystTab({ laudo, allP }) {
+  const [drawerOpen, setDrawerOpen] = useState(false)
   const st     = ST[laudo.status_geral]
   const appOk  = laudo.app.deficit_ha <= 0
   const rlOk   = laudo.rl.percentual_declarado >= laudo.rl.percentual_minimo
@@ -681,35 +1008,98 @@ function AnalystTab({ laudo, allP }) {
             )}
           </div>
         )}
+        {/* Camadas SICAR adicionais */}
+        {laudo.land_use && (
+          <div className="msec">
+            <div className="lv2-section-hd">
+              <div className="lv2-section-title">Camadas SICAR — Uso do Solo</div>
+              <div className={`lv2-chip ${laudo.land_use.status}`}>{ST[laudo.land_use.status].label}</div>
+            </div>
+
+            {/* Land use composition bar */}
+            <LandUseBar laudo={laudo} />
+
+            {/* Metrics grid */}
+            <div className="lu-grid">
+              <LuMetric
+                icon="🌳" label="RL Poligonal"
+                value={laudo.land_use.rl_polygon_encontrado
+                  ? `${laudo.land_use.rl_polygon_ha.toFixed(1)} ha`
+                  : 'Não cadastrado'}
+                sub={laudo.land_use.rl_polygon_encontrado
+                  ? `vs ${laudo.rl.area_declarada_ha.toFixed(1)} ha declarado`
+                  : 'Polígono RL não encontrado no SICAR'}
+                status={laudo.land_use.rl_polygon_encontrado ? 'ok' : 'atencao'}
+              />
+              <LuMetric
+                icon="🏗️" label="Área Consolidada"
+                value={laudo.land_use.area_consolidada_ha > 0
+                  ? `${laudo.land_use.area_consolidada_ha.toFixed(1)} ha`
+                  : '—'}
+                sub={laudo.land_use.pra_elegivel_ha > 0
+                  ? `~${laudo.land_use.pra_elegivel_ha.toFixed(1)} ha elegível ao PRA`
+                  : 'Uso agropecuário anterior a jul/2008'}
+                status={laudo.land_use.pra_elegivel_ha > 0 ? 'atencao' : 'ok'}
+              />
+              <LuMetric
+                icon="🌊" label="Uso Restrito"
+                value={laudo.land_use.uso_restrito_ha > 0
+                  ? `${laudo.land_use.uso_restrito_ha.toFixed(1)} ha`
+                  : '—'}
+                sub={laudo.land_use.uso_restrito_tipos.length > 0
+                  ? laudo.land_use.uso_restrito_tipos.slice(0, 2).join(', ')
+                  : 'art. 9° Código Florestal'}
+                status={laudo.land_use.uso_restrito_ha > 0 ? 'atencao' : 'ok'}
+              />
+              <LuMetric
+                icon="🌾" label="Pousio"
+                value={laudo.land_use.area_pousio_ha > 0
+                  ? `${laudo.land_use.area_pousio_ha.toFixed(1)} ha`
+                  : '—'}
+                sub="Descanso entre cultivos"
+                status="ok"
+              />
+              <LuMetric
+                icon="⚡" label="Servidão Admin."
+                value={laudo.land_use.servidao_ha > 0
+                  ? `${laudo.land_use.servidao_ha.toFixed(1)} ha`
+                  : '—'}
+                sub={laudo.land_use.servidao_tipos.length > 0
+                  ? laudo.land_use.servidao_tipos.slice(0, 2).join(', ')
+                  : 'Infraestrutura'}
+                status={laudo.land_use.servidao_ha > 0 ? 'atencao' : 'ok'}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Right — pendências + resumo técnico */}
-      <div className="modal-col">
-        <div className="msec msec--grow">
-          <div className="lv2-p-count" style={{ marginBottom: 10 }}>
-            {allP.length === 0 ? 'Nenhuma pendência'
-              : `${allP.length} pendência${allP.length > 1 ? 's' : ''}${laudo.pendencias_criticas > 0 ? ` · ${laudo.pendencias_criticas} crítica${laudo.pendencias_criticas > 1 ? 's' : ''}` : ''}`}
-          </div>
-          {allP.length === 0 ? (
-            <div className="lv2-ok-card"><div className="lv2-dot good" /><span className="lv2-ok-text">Imóvel em conformidade com o Código Florestal</span></div>
-          ) : (
-            allP.map((p, i) => (
-              <div key={i} className={`lv2-p-card ${p.status}`}>
-                <div className="lv2-p-row">
-                  <div className="lv2-dot" style={{ background: ST[p.status].clr }} />
-                  <span className="lv2-p-title">{p.titulo}</span>
-                  {p.area_ha != null && <span className="lv2-p-area">{p.area_ha.toFixed(1)} ha</span>}
-                </div>
-                <div className="lv2-p-detail">{p.detalhe}</div>
-                <div className="lv2-p-orient">{p.orientacao}</div>
-              </div>
-            ))
+      {/* Right — resumo técnico full-height + pendências drawer */}
+      <div className="modal-col modal-col--right" style={{ position: 'relative' }}>
+
+        {/* ── Pendências trigger button ─────────────────────────────────── */}
+        <button
+          className={`pend-trigger pend-trigger--${laudo.status_geral}${drawerOpen ? ' pend-trigger--active' : ''}`}
+          onClick={() => setDrawerOpen(o => !o)}
+          title="Ver pendências"
+        >
+          <span className="pend-trigger-icon">
+            {laudo.pendencias_criticas > 0 ? '🚨' : allP.length > 0 ? '⚠️' : '✅'}
+          </span>
+          <span className="pend-trigger-label">
+            {allP.length === 0
+              ? 'Sem pendências'
+              : `${allP.length} pendência${allP.length > 1 ? 's' : ''}`}
+          </span>
+          {laudo.pendencias_criticas > 0 && (
+            <span className="pend-trigger-crit">{laudo.pendencias_criticas} crítica{laudo.pendencias_criticas > 1 ? 's' : ''}</span>
           )}
-        </div>
+          <span className="pend-trigger-arrow">{drawerOpen ? '▶' : '◀'}</span>
+        </button>
 
-        <div className={`tech-resumo-card trc--${laudo.status_geral}`}>
+        {/* ── Resumo técnico — full height ─────────────────────────────── */}
+        <div className={`tech-resumo-card trc--${laudo.status_geral} trc--full`}>
 
-          {/* Banner: título + badge de status */}
           <div className={`trc-top trc-top--${laudo.status_geral}`}>
             <div className="trc-top-left">
               <span className="trc-doc-icon">📋</span>
@@ -729,7 +1119,6 @@ function AnalystTab({ laudo, allP }) {
             </div>
           </div>
 
-          {/* Grid de metadados 2×2 */}
           <div className="trc-meta-grid">
             <div className="trc-meta-item">
               <div className="trc-meta-lbl">Área do Imóvel</div>
@@ -745,7 +1134,12 @@ function AnalystTab({ laudo, allP }) {
             </div>
             <div className="trc-meta-item">
               <div className="trc-meta-lbl">Pendências</div>
-              <div className={`trc-meta-val ${laudo.pendencias_criticas > 0 ? 'bad' : laudo.total_pendencias > 0 ? 'warn' : 'good'}`}>
+              <div
+                className={`trc-meta-val trc-pend-link ${laudo.pendencias_criticas > 0 ? 'bad' : allP.length > 0 ? 'warn' : 'good'}`}
+                onClick={() => setDrawerOpen(true)}
+                style={{ cursor: 'pointer' }}
+                title="Abrir pendências"
+              >
                 {laudo.total_pendencias}
                 {laudo.pendencias_criticas > 0 && (
                   <span className="trc-crit-sub"> · {laudo.pendencias_criticas} crítica{laudo.pendencias_criticas > 1 ? 's' : ''}</span>
@@ -754,17 +1148,261 @@ function AnalystTab({ laudo, allP }) {
             </div>
           </div>
 
-          {/* Corpo do texto — suporte a markdown */}
-          <Markdown text={laudo.resumo_tecnico || '—'} className="trc-body" />
+          <Markdown text={laudo.resumo_tecnico || '—'} className="trc-body trc-body--full" />
 
-          {/* Footer: CAR code + data */}
           <div className="trc-footer">
             <span className="trc-car">{laudo.car_code ?? 'Geometria manual'}</span>
             <span>{new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })}</span>
           </div>
         </div>
+
+        {/* ── Pendências drawer (slide from right) ─────────────────────── */}
+        <div className={`pend-drawer${drawerOpen ? ' pend-drawer--open' : ''}`}>
+          <div className="pend-drawer-hd">
+            <div className="pend-drawer-hd-left">
+              <span className="pend-drawer-title">Pendências</span>
+              <span className={`pend-drawer-badge ${laudo.pendencias_criticas > 0 ? 'critico' : allP.length > 0 ? 'atencao' : 'ok'}`}>
+                {allP.length}
+              </span>
+            </div>
+            <button className="pend-drawer-close" onClick={() => setDrawerOpen(false)}>×</button>
+          </div>
+          <div className="pend-drawer-body">
+            {allP.length === 0 ? (
+              <div className="lv2-ok-card">
+                <div className="lv2-dot good" />
+                <span className="lv2-ok-text">Imóvel em conformidade com o Código Florestal</span>
+              </div>
+            ) : (
+              allP.map((p, i) => (
+                <div key={i} className={`lv2-p-card ${p.status}`}>
+                  <div className="lv2-p-row">
+                    <div className="lv2-dot" style={{ background: ST[p.status].clr }} />
+                    <span className="lv2-p-title">{p.titulo}</span>
+                    {p.area_ha != null && <span className="lv2-p-area">{p.area_ha.toFixed(1)} ha</span>}
+                  </div>
+                  <div className="lv2-p-detail">{p.detalhe}</div>
+                  <div className="lv2-p-orient">{p.orientacao}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
       </div>
 
+    </div>
+  )
+}
+
+/* ── Aba Metodologias ────────────────────────────────────────────────────── */
+const METODO_SECTIONS = [
+  {
+    id: 'app',
+    icon: '🌊',
+    title: 'APP — Área de Preservação Permanente',
+    leis: ['Art. 4°, Lei 12.651/2012', 'Art. 61-A §§1–4, Lei 12.651/2012'],
+    items: [
+      {
+        label: 'Faixas marginais de cursos d\'água (Art. 4°, I)',
+        texto: 'A largura mínima da APP é definida pela largura do curso d\'água: até 10m → 30m de faixa; 10–50m → 50m; 50–200m → 100m; 200–600m → 200m; acima de 600m → 500m.',
+      },
+      {
+        label: 'Áreas consolidadas — pequenas propriedades (Art. 61-A)',
+        texto: 'Para imóveis com uso agropecuário anterior a jul/2008, a faixa de recomposição é reduzida por porte: ≤1 MF → 5m; 1–2 MF → 8m; 2–4 MF → 15m; >4 MF → 20–200m conforme largura.',
+      },
+      {
+        label: 'Método de cálculo',
+        texto: 'Buffer geométrico aplicado sobre a hidrografia declarada no SICAR (sicar_hidrografia), reprojetado para EPSG:31981 (métrico), intersecionado com o polígono do imóvel e reconvertido para WGS84.',
+      },
+      {
+        label: 'Simplificação MVP',
+        texto: 'Quando a largura do curso d\'água não está declarada no SICAR, aplica-se o buffer mínimo do Art. 4° (30m) ou o buffer Art. 61-A correspondente ao porte. Um déficit < 2 ha nessa condição é classificado como ATENÇÃO, não CRÍTICO.',
+      },
+    ],
+  },
+  {
+    id: 'rl',
+    icon: '🌳',
+    title: 'RL — Reserva Legal',
+    leis: ['Art. 12, Lei 12.651/2012', 'Art. 67, Lei 12.651/2012'],
+    items: [
+      {
+        label: 'Percentuais mínimos por bioma (Art. 12)',
+        texto: 'Amazônia Legal: 80%. Cerrado dentro da Amazônia Legal (ex: norte de MT): 35%. Cerrado fora da Amazônia Legal, Caatinga, Pantanal, Pampa: 20%.',
+      },
+      {
+        label: 'Regime especial — pequena propriedade (Art. 67)',
+        texto: 'Imóveis com até 4 módulos fiscais cujo CAR foi inscrito até 05/05/2014 podem ter como RL a vegetação nativa existente na data da inscrição, independentemente do percentual mínimo do bioma.',
+      },
+      {
+        label: 'Determinação do bioma',
+        texto: 'O bioma é determinado pelo centróide do imóvel. Para Mato Grosso: latitudes acima de −13° são classificadas como Amazônia Legal (80%); abaixo, como Cerrado dentro da Amazônia Legal (35%). Fronteira exata via polígono IBGE pode ser adicionada em versão futura.',
+      },
+      {
+        label: 'Fonte de vegetação',
+        texto: 'Camada sicar_vegetacao_nativa do SICAR. Quando disponível, filtrada pelo cod_imovel do próprio imóvel para evitar contabilizar vegetação de propriedades vizinhas.',
+      },
+    ],
+  },
+  {
+    id: 'desmat',
+    icon: '🛰️',
+    title: 'Alertas de Desmatamento',
+    leis: ['Lei 12.651/2012', 'PPCDAM/PPCERRADO'],
+    items: [
+      {
+        label: 'PRODES — Projeto de Monitoramento do Desmatamento',
+        texto: 'Polígonos de desmatamento anual do INPE/MapBiomas (Amazônia, Cerrado, demais biomas). Detecta cortes rasos consolidados. Resolução ~30m. Atualização anual.',
+      },
+      {
+        label: 'DETER — Sistema de Detecção em Tempo Real',
+        texto: 'Alertas do INPE para detecção rápida de desmatamento e degradação. Menor área mínima mapeável (~1–3 ha). Atualização quase diária. Inclui cicatrizes de fogo e degradação.',
+      },
+      {
+        label: 'Método',
+        texto: 'Interseção espacial entre o polígono do imóvel (WGS84) e as camadas PRODES/DETER. Área afetada calculada em EPSG:31981.',
+      },
+    ],
+  },
+  {
+    id: 'restric',
+    icon: '⚖️',
+    title: 'Restrições Territoriais',
+    leis: ['Estatuto do Índio (Lei 6.001/1973)', 'SNUC (Lei 9.985/2000)'],
+    items: [
+      {
+        label: 'Terras Indígenas — FUNAI',
+        texto: 'Polígonos oficiais das TIs demarcadas, homologadas ou em processo de demarcação, disponibilizados pela FUNAI. Sobreposição com TI inviabiliza a atividade agropecuária e pode gerar embargo.',
+      },
+      {
+        label: 'Unidades de Conservação — CNUC',
+        texto: 'Cadastro Nacional de Unidades de Conservação (MMA). Inclui proteção integral (ex: Parques Nacionais) e uso sustentável (ex: APA, FLONA). O grau de restrição varia por categoria.',
+      },
+      {
+        label: 'Método',
+        texto: 'Interseção do polígono do imóvel com as camadas de TI (ti_sirgeas) e UC (uc_cnuc). Área sobreposta calculada em EPSG:31981.',
+      },
+    ],
+  },
+  {
+    id: 'solo',
+    icon: '🧪',
+    title: 'Análise de Solo',
+    leis: ['Fonte: SoilGrids / ISRIC World Soil Information'],
+    items: [
+      {
+        label: 'SoilGrids 2.0',
+        texto: 'Base global de propriedades do solo com resolução de 250m, produzida pelo ISRIC. Modelos de aprendizado de máquina treinados em ~240.000 perfis de solo.',
+      },
+      {
+        label: 'Variáveis consultadas',
+        texto: 'pH em água (0–15cm); argila, silte e areia (%); carbono orgânico total (g/kg); estimativa de estoque de carbono (tC/ha). Textura classificada pelo triângulo USDA.',
+      },
+      {
+        label: 'Limitações',
+        texto: 'Estimativa regional (250m). Não substitui análise laboratorial. Indicado para triagem e orientação geral.',
+      },
+    ],
+  },
+  {
+    id: 'sicar',
+    icon: '🗂️',
+    title: 'Camadas SICAR — Uso do Solo',
+    leis: ['Lei 12.651/2012 (Código Florestal)', 'Decreto 7.830/2012 (SICAR)'],
+    items: [
+      { label: 'sicar_vegetacao_nativa', texto: 'Vegetação nativa declarada no CAR. Base para cálculo de RL e conformidade do Art. 12.' },
+      { label: 'sicar_reserva_legal', texto: 'Polígono de RL averbado ou proposto. Permite comparar geometria declarada com vegetação nativa.' },
+      { label: 'sicar_area_consolidada', texto: 'Áreas com uso agropecuário consolidado antes de 22/07/2008. Critério para Art. 61-A (APP) e Art. 66 (RL).' },
+      { label: 'sicar_uso_restrito', texto: 'Uso restrito declarado (Art. 9°): várzeas, planícies inundáveis. Uso permitido com restrições específicas.' },
+      { label: 'sicar_area_pousio', texto: 'Áreas em descanso temporário entre cultivos. Indicam histórico de uso agropecuário.' },
+      { label: 'sicar_servidao_administrativa', texto: 'Servidões de infraestrutura (linhas de transmissão, dutos, rodovias). Podem sobrepor APP/RL com regras específicas.' },
+    ],
+  },
+  {
+    id: 'geral',
+    icon: '📐',
+    title: 'Considerações Metodológicas Gerais',
+    leis: [],
+    items: [
+      {
+        label: 'Sistema de referência',
+        texto: 'Geometrias em WGS84 (EPSG:4326). Cálculos de área e buffer em EPSG:31981 (SIRGAS 2000 / UTM Zona 21S), adequado para Mato Grosso.',
+      },
+      {
+        label: 'Fonte dos dados',
+        texto: 'Dados do SICAR (Serviço Florestal Brasileiro) em formato GeoParquet. Versão conforme disponível no repositório do hackathon ENAP 2026.',
+      },
+      {
+        label: 'Limitações do MVP',
+        texto: 'Protótipo demonstrativo. Análise baseada em dados declaratórios do CAR e bases públicas nacionais. Não substitui vistoria de campo, laudos técnicos assinados por profissional habilitado nem decisão administrativa da SEMA-MT.',
+      },
+      {
+        label: 'Resumos com IA',
+        texto: 'Quando ativado, os resumos são gerados pelo modelo Claude (Anthropic) com base nos dados calculados. Revise sempre os valores numéricos antes de uso oficial.',
+      },
+    ],
+  },
+]
+
+function MethodologyTab({ laudo }) {
+  const [open, setOpen] = useState({})
+  const toggle = (id) => setOpen(o => ({ ...o, [id]: !o[id] }))
+
+  const appInfo = laudo.app?.pendencias?.find(p => p.codigo === 'APP_ART61A_APLICADO')
+  const art67   = laudo.rl?.pendencias?.find(p => p.codigo?.startsWith('RL_ART67'))
+
+  return (
+    <div className="metodo-wrap">
+      {(appInfo || art67) && (
+        <div className="metodo-context-banner">
+          <div className="metodo-context-title">Artigos especiais aplicados nesta análise</div>
+          <div className="metodo-context-pills">
+            {appInfo && (
+              <div className="metodo-pill metodo-pill--ok">
+                <span>🌊</span>
+                <span>Art. 61-A aplicado — APP com buffer reduzido ({laudo.cadastro?.mod_fiscal?.toFixed(1)} MF)</span>
+              </div>
+            )}
+            {art67 && (
+              <div className="metodo-pill metodo-pill--ok">
+                <span>🌳</span>
+                <span>Art. 67 aplicado — RL pelo regime de pequena propriedade</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="metodo-list">
+        {METODO_SECTIONS.map(sec => (
+          <div key={sec.id} className={`metodo-sec ${open[sec.id] ? 'open' : ''}`}>
+            <button className="metodo-sec-hd" onClick={() => toggle(sec.id)}>
+              <span className="metodo-sec-icon">{sec.icon}</span>
+              <div className="metodo-sec-hd-body">
+                <div className="metodo-sec-title">{sec.title}</div>
+                {sec.leis.length > 0 && (
+                  <div className="metodo-sec-leis">
+                    {sec.leis.map((l, i) => <span key={i} className="metodo-lei-chip">{l}</span>)}
+                  </div>
+                )}
+              </div>
+              <span className="metodo-chevron">{open[sec.id] ? '▾' : '▸'}</span>
+            </button>
+
+            {open[sec.id] && (
+              <div className="metodo-sec-body">
+                {sec.items.map((item, i) => (
+                  <div key={i} className="metodo-item">
+                    <div className="metodo-item-label">{item.label}</div>
+                    <div className="metodo-item-texto">{item.texto}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -772,10 +1410,35 @@ function AnalystTab({ laudo, allP }) {
 /* ── Modal principal ─────────────────────────────────────────────────────── */
 export default function LaudoModal({ laudo, onClose }) {
   const [activeTab, setActiveTab] = useState('produtor')
+  const [emailState, setEmailState] = useState({ open: false, address: '', sending: false, sent: false, error: null })
+  const emailInputRef = useRef(null)
+
+  useEffect(() => {
+    if (emailState.open) setTimeout(() => emailInputRef.current?.focus(), 80)
+  }, [emailState.open])
+
+  async function sendReport() {
+    const addr = emailState.address.trim()
+    if (!addr || emailState.sending) return
+    setEmailState(s => ({ ...s, sending: true, error: null }))
+    try {
+      const res = await fetch(`${API_BASE}/send-report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: addr, laudo }),
+      })
+      if (!res.ok) throw new Error((await res.json()).detail || 'Erro ao enviar')
+      setEmailState(s => ({ ...s, sending: false, sent: true }))
+      setTimeout(() => setEmailState({ open: false, address: '', sending: false, sent: false, error: null }), 5000)
+    } catch (e) {
+      setEmailState(s => ({ ...s, sending: false, error: e.message }))
+    }
+  }
 
   const allP = [
     ...laudo.app.pendencias, ...laudo.rl.pendencias,
     ...laudo.desmatamento.pendencias, ...laudo.restricoes.pendencias,
+    ...(laudo.land_use?.pendencias ?? []),
   ]
 
   return (
@@ -788,8 +1451,72 @@ export default function LaudoModal({ laudo, onClose }) {
             <div className="modal-hd-title">Laudo de Conformidade CAR</div>
             {laudo.car_code && <div className="modal-hd-sub">{laudo.car_code}</div>}
           </div>
-          <div className="modal-hd-actions">
-            <button className="modal-btn-pdf" onClick={() => exportPDF(laudo)}>↓ Exportar PDF</button>
+          <div className="modal-hd-actions" style={{ position: 'relative' }}>
+            {/* WhatsApp */}
+            <a
+              className="modal-btn-wpp"
+              href={`https://wa.me/?text=${encodeURIComponent(buildWhatsAppText(laudo))}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Compartilhar resumo no WhatsApp"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style={{verticalAlign:'middle',marginRight:5}}>
+                <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.01c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413z"/>
+              </svg>
+              WhatsApp
+            </a>
+
+            {/* Email */}
+            <button
+              className={`modal-btn-email ${emailState.sent ? 'sent' : ''}`}
+              onClick={() => setEmailState(s => ({ ...s, open: !s.open, error: null }))}
+              title="Enviar laudo por email"
+            >
+              {emailState.sent ? '✓ Enviado!' : '✉ Email'}
+            </button>
+
+            {/* Email form dropdown */}
+            {emailState.open && (
+              <div className="modal-email-form" onClick={e => e.stopPropagation()}>
+                {emailState.sent ? (
+                  <div className="modal-email-success">
+                    <span className="modal-email-success-icon">✓</span>
+                    <div>
+                      <div className="modal-email-success-title">Email enviado!</div>
+                      <div className="modal-email-success-sub">Verifique também a pasta de spam</div>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="modal-email-form-title">Enviar laudo técnico</div>
+                    <div className="modal-email-form-sub">Para analista OEMA ou técnico responsável</div>
+                    <div className="modal-email-input-row">
+                      <input
+                        ref={emailInputRef}
+                        type="email"
+                        className="modal-email-input"
+                        placeholder="email@sema.mt.gov.br"
+                        value={emailState.address}
+                        onChange={e => setEmailState(s => ({ ...s, address: e.target.value, error: null }))}
+                        onKeyDown={e => e.key === 'Enter' && sendReport()}
+                      />
+                      <button
+                        className="modal-email-send"
+                        onClick={sendReport}
+                        disabled={emailState.sending || !emailState.address.trim()}
+                      >
+                        {emailState.sending ? '...' : 'Enviar'}
+                      </button>
+                    </div>
+                    {emailState.error && (
+                      <div className="modal-email-error">{emailState.error}</div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            <button className="modal-btn-pdf" onClick={() => exportPDF(laudo)}>↓ PDF</button>
             <button className="modal-btn-close" onClick={onClose}>×</button>
           </div>
         </div>
@@ -810,6 +1537,13 @@ export default function LaudoModal({ laudo, onClose }) {
             <span className="modal-tab-icon">📊</span>
             Análise Técnica
           </button>
+          <button
+            className={`modal-tab ${activeTab === 'metodologia' ? 'active' : ''}`}
+            onClick={() => setActiveTab('metodologia')}
+          >
+            <span className="modal-tab-icon">📜</span>
+            Metodologias
+          </button>
           <div className="modal-tab-fill" />
           <div className={`modal-tab-status-pill ${laudo.status_geral}`}>
             {ST[laudo.status_geral].label} · {laudo.total_pendencias} pendência{laudo.total_pendencias !== 1 ? 's' : ''}
@@ -819,7 +1553,9 @@ export default function LaudoModal({ laudo, onClose }) {
         {/* Tab content */}
         {activeTab === 'produtor'
           ? <ProducerTab laudo={laudo} allP={allP} />
-          : <AnalystTab  laudo={laudo} allP={allP} />
+          : activeTab === 'analista'
+          ? <AnalystTab  laudo={laudo} allP={allP} />
+          : <MethodologyTab laudo={laudo} />
         }
 
       </div>

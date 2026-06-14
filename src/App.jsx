@@ -3,6 +3,7 @@ import MapView from './components/MapView'
 import LaudoModal from './components/LaudoModal'
 import ImovelModal from './components/ImovelModal'
 import DashboardPanel from './components/DashboardPanel'
+import EscolaPanel from './components/EscolaPanel'
 import './styles.css'
 
 const API_BASE   = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -49,8 +50,9 @@ export default function App() {
   const [theme, setTheme]       = useState(() => localStorage.getItem('car-theme') || 'dark')
   const [history, setHistory]   = useState(loadHistory)
   const [histOpen, setHistOpen] = useState(true)
-  const [dashOpen, setDashOpen] = useState(false)
-  const [useAI, setUseAI]       = useState(() => localStorage.getItem('car-use-ai') !== 'false')
+  const [dashOpen, setDashOpen]   = useState(false)
+  const [escolaOpen, setEscolaOpen] = useState(false)
+  const [useAI, setUseAI]         = useState(() => localStorage.getItem('car-use-ai') !== 'false')
   const [imovelCode, setImovelCode] = useState(null)
 
   const mapRef     = useRef(null)
@@ -68,7 +70,23 @@ export default function App() {
 
   // Globais para popups do mapa dispararem ações React
   useEffect(() => {
-    window.__carDoutorAnalyze  = (code) => { setCarCode(code); runAnalysis({ car_code: code }, null) }
+    window.__carDoutorAnalyze  = async (code, fallbackLng, fallbackLat) => {
+      setCarCode(code)
+      let bbox = null
+      try {
+        const res = await fetch(`${API_BASE}/locate/${encodeURIComponent(code)}`)
+        if (res.ok) bbox = (await res.json()).bbox
+      } catch { /* silencioso */ }
+      if (!bbox && fallbackLng != null) {
+        const d = 0.04
+        bbox = [fallbackLng - d, fallbackLat - d, fallbackLng + d, fallbackLat + d]
+      }
+      if (bbox) {
+        mapRef.current?.flyToBbox(bbox)
+        mapRef.current?.startScanAnimation(bbox)
+      }
+      runAnalysis({ car_code: code }, null)
+    }
     window.__carDoutorImovelData = (code) => { setModalOpen(false); setImovelCode(code) }
     return () => { delete window.__carDoutorAnalyze; delete window.__carDoutorImovelData }
   }, [useAI]) // re-registra quando useAI muda para capturar o valor atual
@@ -86,6 +104,7 @@ export default function App() {
       idx += 1
       if (idx >= analysisSteps.length) return
       setLoadingStep(idx)
+      mapRef.current?.updateScanStep(idx)
       if (analysisSteps[idx].ms < 99999) {
         stepTimer.current = setTimeout(advance, analysisSteps[idx].ms)
       }
@@ -120,18 +139,20 @@ export default function App() {
       const geom = geometry || data.geometry || null
       if (geom) mapRef.current?.showResult(data, geom)
 
-      // Save to history
-      const entry = {
-        id: Date.now(),
-        ts: new Date().toISOString(),
-        car_code: data.car_code || null,
-        area_ha: data.area_imovel_ha,
-        municipio: data.municipio || null,
-        status: data.status_geral,
-        pendencias: data.total_pendencias,
-        laudo: data,
-      }
+      // Save to history — atualiza entrada existente se mesmo car_code
       setHistory(prev => {
+        const carCode = data.car_code || null
+        const existing = carCode ? prev.find(h => h.car_code === carCode) : null
+        const entry = {
+          id: existing ? existing.id : Date.now(),
+          ts: new Date().toISOString(),
+          car_code: carCode,
+          area_ha: data.area_imovel_ha,
+          municipio: data.municipio || null,
+          status: data.status_geral,
+          pendencias: data.total_pendencias,
+          laudo: data,
+        }
         const next = [entry, ...prev.filter(h => h.id !== entry.id)].slice(0, MAX_HISTORY)
         saveHistory(next)
         return next
@@ -140,17 +161,39 @@ export default function App() {
       setError(e.message)
     } finally {
       setLoading(false)
+      mapRef.current?.stopScanAnimation()
     }
   }
 
-  function handleCarSearch(e) {
+  async function handleCarSearch(e) {
     e.preventDefault()
-    if (!carCode.trim()) return
-    runAnalysis({ car_code: carCode.trim() }, null)
+    const code = carCode.trim()
+    if (!code) return
+
+    // Voa imediatamente para a região antes de esperar a análise completa
+    try {
+      const res = await fetch(`${API_BASE}/locate/${encodeURIComponent(code)}`)
+      if (res.ok) {
+        const loc = await res.json()
+        mapRef.current?.flyToBbox(loc.bbox)
+        mapRef.current?.startScanAnimation(loc.bbox)
+      }
+    } catch { /* silencioso — a análise continua normalmente */ }
+
+    runAnalysis({ car_code: code }, null)
   }
 
   const handlePolygonDrawn = useCallback((geometry) => {
     setDrawingMode(false)
+    const coords = geometry.type === 'MultiPolygon'
+      ? geometry.coordinates.flatMap(p => p[0])
+      : geometry.coordinates[0]
+    const lngs = coords.map(c => c[0])
+    const lats = coords.map(c => c[1])
+    mapRef.current?.startScanAnimation([
+      Math.min(...lngs), Math.min(...lats),
+      Math.max(...lngs), Math.max(...lats),
+    ])
     runAnalysis({ geometry }, geometry)
   }, [])
 
@@ -165,7 +208,6 @@ export default function App() {
 
   function openHistoryItem(entry) {
     setLaudo(entry.laudo)
-    setModalOpen(true)
     const geom = entry.laudo.geometry || null
     if (geom) mapRef.current?.showResult(entry.laudo, geom)
   }
@@ -200,6 +242,13 @@ export default function App() {
           <div className="header-row">
             <h1>🌿 CAR Doutor</h1>
             <div className="header-actions">
+              <button
+                className="escola-btn"
+                onClick={() => setEscolaOpen(true)}
+                title="Escola do Produtor"
+              >
+                📚
+              </button>
               <button
                 className={`dash-toggle-btn ${dashOpen ? 'active' : ''}`}
                 onClick={() => setDashOpen(o => !o)}
@@ -318,6 +367,7 @@ export default function App() {
           </div>
         )}
 
+
         {!laudo && !loading && !error && history.length === 0 && (
           <div className="sidebar-hint">
             Insira um código CAR ou desenhe o imóvel no mapa para iniciar a análise.
@@ -377,12 +427,33 @@ export default function App() {
       <MapView ref={mapRef} drawingMode={drawingMode} onPolygonDrawn={handlePolygonDrawn} />
 
       {/* ── Dashboard Panel ── */}
-      <DashboardPanel mapRef={mapRef} open={dashOpen} onClose={() => setDashOpen(false)} onSelect={() => setModalOpen(false)} />
+      <DashboardPanel
+        mapRef={mapRef}
+        open={dashOpen}
+        onClose={() => setDashOpen(false)}
+        onSelect={() => setModalOpen(false)}
+        onAnalyze={async (code) => {
+          setCarCode(code)
+          setModalOpen(false)
+          try {
+            const res = await fetch(`${API_BASE}/locate/${encodeURIComponent(code)}`)
+            if (res.ok) {
+              const loc = await res.json()
+              mapRef.current?.flyToBbox(loc.bbox)
+              mapRef.current?.startScanAnimation(loc.bbox)
+            }
+          } catch { /* silencioso */ }
+          runAnalysis({ car_code: code }, null)
+        }}
+      />
 
       {/* ── Laudo Modal ── */}
       {modalOpen && laudo && (
         <LaudoModal laudo={laudo} onClose={() => setModalOpen(false)} />
       )}
+
+      {/* ── Escola do Produtor ── */}
+      {escolaOpen && <EscolaPanel onClose={() => setEscolaOpen(false)} />}
 
       {/* ── Imovel Data Modal ── */}
       {imovelCode && (

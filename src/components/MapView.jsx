@@ -16,6 +16,75 @@ const REGION_SOURCE    = 'region-hull'
 const REGION_FILL      = 'region-fill'
 const REGION_OUTLINE   = 'region-outline'
 
+// SICAR internal layers shown after property analysis
+const SICAR_LAYERS = [
+  { key: 'reserva_legal',           label: 'Reserva Legal',          color: '#1b5e20', opacity: 0.5 },
+  { key: 'vegetacao_nativa',        label: 'Vegetação Nativa',       color: '#388e3c', opacity: 0.4 },
+  { key: 'area_consolidada',        label: 'Área Consolidada',       color: '#c8a97e', opacity: 0.5 },
+  { key: 'uso_restrito',            label: 'Uso Restrito',           color: '#f5a623', opacity: 0.55 },
+  { key: 'area_pousio',             label: 'Pousio',                 color: '#d4c200', opacity: 0.5 },
+  { key: 'servidao_administrativa', label: 'Servidão Adm.',          color: '#9c27b0', opacity: 0.55 },
+]
+
+const SICAR_SOURCE  = k => `sicar-src-${k}`
+const SICAR_FILL    = k => `sicar-fill-${k}`
+const SICAR_OUTLINE = k => `sicar-outline-${k}`
+
+const SCAN_BBOX_SRC  = 'scan-bbox'
+const SCAN_LINE_SRC  = 'scan-line'
+const SPOTLIGHT_SRC  = 'spotlight'
+
+function makeSpotlightData(holeCoords) {
+  return {
+    type: 'FeatureCollection',
+    features: [{
+      type: 'Feature',
+      geometry: {
+        type: 'Polygon',
+        coordinates: [
+          [[-180, -85], [-180, 85], [180, 85], [180, -85], [-180, -85]],
+          holeCoords,
+        ],
+      },
+    }],
+  }
+}
+
+function bboxToHoleRing([minLng, minLat, maxLng, maxLat]) {
+  const dLng = (maxLng - minLng) * 0.1
+  const dLat = (maxLat - minLat) * 0.1
+  return [
+    [minLng - dLng, minLat - dLat],
+    [maxLng + dLng, minLat - dLat],
+    [maxLng + dLng, maxLat + dLat],
+    [minLng - dLng, maxLat + dLat],
+    [minLng - dLng, minLat - dLat],
+  ]
+}
+
+function geometryToRing(geometry) {
+  if (!geometry) return null
+  let ring
+  if (geometry.type === 'Polygon') ring = geometry.coordinates[0]
+  else if (geometry.type === 'MultiPolygon') {
+    ring = geometry.coordinates.reduce((a, b) =>
+      a[0].length >= b[0].length ? a : b
+    )[0]
+  }
+  // GeoJSON exterior rings são CCW; para buraco no polígono invertido precisa de CW
+  return ring ? [...ring].reverse() : null
+}
+
+const STEP_LAYERS = { 3: ['prodes'], 4: ['deter', 'ti'], 5: ['uc'] }
+const STEP_MAP_LABELS = {
+  0: { icon: '📍', text: 'Localizando imóvel...' },
+  1: { icon: '🌊', text: 'Verificando APP...' },
+  2: { icon: '🌳', text: 'Verificando RL...' },
+  3: { icon: '🛰️', text: 'Consultando PRODES/DETER...' },
+  4: { icon: '⚖️', text: 'Verificando TI/UC...' },
+  5: { icon: '🧪', text: 'Analisando solo...' },
+}
+
 const OVERLAYS = [
   { id: 'prodes', label: 'PRODES Desmatamento', color: '#cc2200', dot: '#ff4422',
     fill: '#cc2200', fillOpacity: 0.45, line: '#ff4422' },
@@ -103,59 +172,113 @@ function clearOverlaySource(map, id) {
 
 // ── Layer toggle panel ────────────────────────────────────────────────────────
 function LayerPanel({ active, loading, onToggle }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(false)
+
+  if (!open) {
+    const activeCount = active.size
+    return (
+      <button
+        className={`layer-panel-btn ${activeCount > 0 ? 'has-active' : ''}`}
+        onClick={() => setOpen(true)}
+        title="Camadas"
+      >
+        <span className="layer-panel-btn-icon">◧</span>
+        {activeCount > 0 && <span className="layer-panel-btn-badge">{activeCount}</span>}
+      </button>
+    )
+  }
+
   return (
     <div className="layer-panel">
-      <button className="layer-panel-hd" onClick={() => setOpen(o => !o)}>
+      <button className="layer-panel-hd" onClick={() => setOpen(false)}>
         <span className="layer-panel-icon">◧</span>
         <span>Camadas</span>
-        <span className={`layer-panel-chevron ${open ? 'open' : ''}`}>▾</span>
+        <span className="layer-panel-close">✕</span>
       </button>
-      {open && (
-        <div className="layer-panel-items">
-          {OVERLAYS.map(ov => {
-            const on  = active.has(ov.id)
-            const ldg = loading.has(ov.id)
-            return (
-              <button
-                key={ov.id}
-                className={`layer-btn ${on ? 'on' : ''} ${ldg ? 'loading' : ''}`}
-                onClick={() => onToggle(ov.id)}
-                style={on ? { borderColor: ov.color, background: ov.color + '18' } : {}}
-                disabled={ldg}
-              >
-                {ldg
-                  ? <span className="layer-spinner" />
-                  : <span className="layer-dot" style={{ background: on ? ov.dot : 'var(--lp-dot-off)' }} />
-                }
-                <span>{ov.label}</span>
-              </button>
-            )
-          })}
-        </div>
-      )}
+      <div className="layer-panel-items">
+        {OVERLAYS.map(ov => {
+          const on  = active.has(ov.id)
+          const ldg = loading.has(ov.id)
+          return (
+            <button
+              key={ov.id}
+              className={`layer-btn ${on ? 'on' : ''} ${ldg ? 'loading' : ''}`}
+              onClick={() => onToggle(ov.id)}
+              style={on ? { borderColor: ov.color, background: ov.color + '18' } : {}}
+              disabled={ldg}
+            >
+              {ldg
+                ? <span className="layer-spinner" />
+                : <span className="layer-dot" style={{ background: on ? ov.dot : 'var(--lp-dot-off)' }} />
+              }
+              <span>{ov.label}</span>
+            </button>
+          )
+        })}
+      </div>
     </div>
   )
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref) {
-  const mapContainer  = useRef(null)
-  const map           = useRef(null)
-  const drawnPoints   = useRef([])
-  const tempMarkers   = useRef([])
-  const popupRef      = useRef(null)
-  const debounceRef   = useRef(null)
-  const laudoMarker   = useRef(null)
+  const mapContainer   = useRef(null)
+  const map            = useRef(null)
+  const drawnPoints    = useRef([])
+  const tempMarkers    = useRef([])
+  const popupRef       = useRef(null)
+  const debounceRef    = useRef(null)
+  const laudoMarker    = useRef(null)
+  const scanRafRef     = useRef(null)
+  const scanBboxRef    = useRef(null)
+  const scanStartRef   = useRef(0)
+  const scanMarkersRef = useRef([])
 
   const [activeLayers, setActiveLayers] = useState(new Set())
   const [loadingLayers, setLoadingLayers] = useState(new Set())
+
+  async function fetchSicarLayers(carCode) {
+    if (!map.current || !carCode) return
+    try {
+      const res = await fetch(`${API_BASE}/property-layers/${encodeURIComponent(carCode)}`)
+      if (!res.ok) return
+      const data = await res.json()
+      SICAR_LAYERS.forEach(sl => {
+        const fc = data[sl.key]
+        if (!fc) return
+        const src = map.current?.getSource(SICAR_SOURCE(sl.key))
+        if (src) src.setData(fc)
+      })
+    } catch (err) {
+      console.warn('Erro ao carregar camadas SICAR:', err)
+    }
+  }
+
+  function clearSicarLayers() {
+    if (!map.current) return
+    const empty = { type: 'FeatureCollection', features: [] }
+    SICAR_LAYERS.forEach(sl => {
+      map.current.getSource(SICAR_SOURCE(sl.key))?.setData(empty)
+    })
+  }
 
   useImperativeHandle(ref, () => ({
     showResult(laudo, geometry) {
       if (!map.current) return
       showPropertyOnMap(geometry)
       placeLaudoMarker(laudo, geometry)
+      if (laudo?.car_code) fetchSicarLayers(laudo.car_code)
+      // Troca spotlight e scan-bbox-outline para o contorno exato do polígono
+      const ring = geometryToRing(geometry)
+      if (ring) {
+        if (map.current.getLayer('spotlight')) {
+          map.current.getSource(SPOTLIGHT_SRC)?.setData(makeSpotlightData(ring))
+        }
+        map.current.getSource(SCAN_BBOX_SRC)?.setData({
+          type: 'FeatureCollection',
+          features: [{ type: 'Feature', geometry, properties: {} }],
+        })
+      }
     },
     clearResult() {
       if (!map.current) return
@@ -165,6 +288,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
         laudoMarker.current.remove()
         laudoMarker.current = null
       }
+      clearSicarLayers()
     },
     showStatsLayer(fc) {
       if (!map.current) return
@@ -206,6 +330,117 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
       const empty = { type: 'FeatureCollection', features: [] }
       map.current.getSource(STATS_SOURCE)?.setData(empty)
       map.current.getSource(REGION_SOURCE)?.setData(empty)
+    },
+    flyToBbox(bbox) {
+      if (!map.current) return
+      // bbox: [minLng, minLat, maxLng, maxLat]
+      map.current.fitBounds(
+        [[bbox[0], bbox[1]], [bbox[2], bbox[3]]],
+        { padding: 120, maxZoom: 14, duration: 1100, essential: true },
+      )
+    },
+
+    startScanAnimation(bbox) {
+      if (!map.current?.isStyleLoaded()) return
+      const [minLng, minLat, maxLng, maxLat] = bbox
+      scanBboxRef.current = bbox
+
+      // Spotlight: dark overlay com buraco no bbox
+      map.current.getSource(SPOTLIGHT_SRC)?.setData(makeSpotlightData(bboxToHoleRing(bbox)))
+      map.current.setPaintProperty('spotlight', 'fill-opacity', 0.75)
+
+      map.current.getSource(SCAN_BBOX_SRC)?.setData({
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          geometry: {
+            type: 'Polygon',
+            coordinates: [[
+              [minLng, minLat], [maxLng, minLat],
+              [maxLng, maxLat], [minLng, maxLat],
+              [minLng, minLat],
+            ]],
+          },
+        }],
+      })
+
+      if (scanRafRef.current) cancelAnimationFrame(scanRafRef.current)
+      scanStartRef.current = performance.now()
+
+      const rafAnimate = (ts) => {
+        if (!map.current || !scanBboxRef.current) return
+        const [bMinLng, bMinLat, bMaxLng, bMaxLat] = scanBboxRef.current
+        const elapsed = ts - scanStartRef.current
+
+        const sweepT = (elapsed % 3000) / 3000
+        const sweepLat = bMaxLat - sweepT * (bMaxLat - bMinLat)
+        map.current.getSource(SCAN_LINE_SRC)?.setData({
+          type: 'FeatureCollection',
+          features: [{ type: 'Feature', geometry: {
+            type: 'LineString',
+            coordinates: [[bMinLng, sweepLat], [bMaxLng, sweepLat]],
+          }}],
+        })
+
+        const bboxOpacity = 0.4 + 0.4 * Math.sin(elapsed / 600)
+        if (map.current.getLayer('scan-bbox-outline'))
+          map.current.setPaintProperty('scan-bbox-outline', 'line-opacity', bboxOpacity)
+
+        scanRafRef.current = requestAnimationFrame(rafAnimate)
+      }
+      scanRafRef.current = requestAnimationFrame(rafAnimate)
+    },
+
+    updateScanStep(step) {
+      if (!map.current || !scanBboxRef.current) return
+      const [minLng, minLat, maxLng, maxLat] = scanBboxRef.current
+      const lngRange = maxLng - minLng
+      const latRange = maxLat - minLat
+
+      const label = STEP_MAP_LABELS[step]
+      if (label) {
+        const el = document.createElement('div')
+        el.className = 'scan-step-label'
+        el.innerHTML = `<span class="scan-step-icon">${label.icon}</span><span>${label.text}</span>`
+        const lngPos = maxLng + lngRange * 0.06
+        const latPos = maxLat - step * latRange * 0.14
+        const marker = new maplibregl.Marker({ element: el, anchor: 'left' })
+          .setLngLat([lngPos, latPos])
+          .addTo(map.current)
+        scanMarkersRef.current.push(marker)
+        setTimeout(() => {
+          el.style.opacity = '0'
+          setTimeout(() => marker.remove(), 500)
+        }, 2500)
+      }
+
+      const layers = STEP_LAYERS[step] || []
+      layers.forEach(id => {
+        const ov = OVERLAYS.find(o => o.id === id)
+        if (!ov) return
+        addOverlayLayers(map.current, ov)
+        fetchLayer(id)
+        setActiveLayers(prev => new Set([...prev, id]))
+      })
+    },
+
+    stopScanAnimation() {
+      if (scanRafRef.current) {
+        cancelAnimationFrame(scanRafRef.current)
+        scanRafRef.current = null
+      }
+      scanBboxRef.current = null
+      if (!map.current) return
+      const empty = { type: 'FeatureCollection', features: [] }
+      map.current.getSource(SCAN_BBOX_SRC)?.setData(empty)
+      map.current.getSource(SCAN_LINE_SRC)?.setData(empty)
+      scanMarkersRef.current.forEach(m => m.remove())
+      scanMarkersRef.current = []
+      // Limpa spotlight imediatamente, sem fade
+      const emptySpot = { type: 'FeatureCollection', features: [] }
+      map.current.getSource(SPOTLIGHT_SRC)?.setData(emptySpot)
+      if (map.current.getLayer('spotlight'))
+        map.current.setPaintProperty('spotlight', 'fill-opacity', 0)
     },
   }))
 
@@ -270,7 +505,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
         type: 'line',
         source: RESULT_SOURCE,
         filter: ['==', ['get', 'type'], 'property'],
-        paint: { 'line-color': '#4ecb71', 'line-width': 2.5 },
+        paint: { 'line-color': '#00ffaa', 'line-width': 3.5, 'line-opacity': 1 },
       })
 
       // Overlay GeoJSON sources (empty until toggled)
@@ -327,6 +562,57 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
           'circle-stroke-color': 'rgba(255,255,255,0.5)',
           'circle-opacity': 0.8,
         },
+      })
+      // SICAR property overlay sources (empty until analysis result arrives)
+      SICAR_LAYERS.forEach(sl => {
+        map.current.addSource(SICAR_SOURCE(sl.key), {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        })
+        map.current.addLayer({
+          id: SICAR_FILL(sl.key),
+          type: 'fill',
+          source: SICAR_SOURCE(sl.key),
+          paint: { 'fill-color': sl.color, 'fill-opacity': sl.opacity * 0.4 },
+        })
+        map.current.addLayer({
+          id: SICAR_OUTLINE(sl.key),
+          type: 'line',
+          source: SICAR_SOURCE(sl.key),
+          paint: { 'line-color': sl.color, 'line-width': 1.2, 'line-opacity': sl.opacity },
+        })
+      })
+
+      // ── Scan animation + spotlight sources & layers ───────────────────────────
+      const scanEmpty = { type: 'FeatureCollection', features: [] }
+      map.current.addSource(SPOTLIGHT_SRC, { type: 'geojson', data: scanEmpty })
+      map.current.addLayer({
+        id: 'spotlight',
+        type: 'fill',
+        source: SPOTLIGHT_SRC,
+        paint: {
+          'fill-color': '#030f03',
+          'fill-opacity': 0,
+        },
+      })
+      map.current.addSource(SCAN_BBOX_SRC, { type: 'geojson', data: scanEmpty })
+      map.current.addLayer({
+        id: 'scan-bbox-outline',
+        type: 'line',
+        source: SCAN_BBOX_SRC,
+        paint: {
+          'line-color': '#00ffaa',
+          'line-width': 2.5,
+          'line-opacity': 1,
+          'line-dasharray': [8, 4],
+        },
+      })
+      map.current.addSource(SCAN_LINE_SRC, { type: 'geojson', data: scanEmpty })
+      map.current.addLayer({
+        id: 'scan-sweep',
+        type: 'line',
+        source: SCAN_LINE_SRC,
+        paint: { 'line-color': '#00ffaa', 'line-width': 2, 'line-opacity': 0.9 },
       })
     })
 
@@ -429,7 +715,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
           onmouseout="this.style.background='#0d2a0d'"
         >📋 Ver dados do imóvel</button>
         <button
-          onclick="window.__carDoutorAnalyze && window.__carDoutorAnalyze('${car}');this.closest('.maplibregl-popup').remove();"
+          onclick="window.__carDoutorAnalyze && window.__carDoutorAnalyze('${car}',${e.lngLat.lng},${e.lngLat.lat});this.closest('.maplibregl-popup').remove();"
           style="
             margin-top:5px;width:100%;padding:6px 0;
             background:#1b6e1b;color:#fff;border:none;border-radius:6px;
