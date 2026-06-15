@@ -70,7 +70,7 @@ export default function App() {
 
   // Globais para popups do mapa dispararem ações React
   useEffect(() => {
-    window.__carDoutorAnalyze  = async (code, fallbackLng, fallbackLat) => {
+    window.__greenCarAnalyze  = async (code, fallbackLng, fallbackLat) => {
       setCarCode(code)
       let bbox = null
       try {
@@ -87,8 +87,8 @@ export default function App() {
       }
       runAnalysis({ car_code: code }, null)
     }
-    window.__carDoutorImovelData = (code) => { setModalOpen(false); setImovelCode(code) }
-    return () => { delete window.__carDoutorAnalyze; delete window.__carDoutorImovelData }
+    window.__greenCarImovelData = (code) => { setModalOpen(false); setImovelCode(code) }
+    return () => { delete window.__greenCarAnalyze; delete window.__greenCarImovelData }
   }, [useAI]) // re-registra quando useAI muda para capturar o valor atual
 
   const analysisSteps = [...BASE_STEPS, useAI ? STEP_AI : STEP_TEMPLATE]
@@ -207,6 +207,13 @@ export default function App() {
   }
 
   function openHistoryItem(entry) {
+    if (laudo === entry.laudo) {
+      // já ativo — desseleciona e limpa mapa
+      setLaudo(null)
+      mapRef.current?.clearResult()
+      mapRef.current?.stopScanAnimation()
+      return
+    }
     setLaudo(entry.laudo)
     const geom = entry.laudo.geometry || null
     if (geom) mapRef.current?.showResult(entry.laudo, geom)
@@ -240,7 +247,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="header">
           <div className="header-row">
-            <h1>🌿 CAR Doutor</h1>
+            <h1>🌿 Green Car</h1>
             <div className="header-actions">
               <button
                 className="escola-btn"
@@ -251,7 +258,10 @@ export default function App() {
               </button>
               <button
                 className={`dash-toggle-btn ${dashOpen ? 'active' : ''}`}
-                onClick={() => setDashOpen(o => !o)}
+                onClick={() => {
+                  if (dashOpen) mapRef.current?.clearStatsLayer()
+                  setDashOpen(o => !o)
+                }}
                 title="Painel analítico"
               >
                 📊
@@ -430,7 +440,7 @@ export default function App() {
       <DashboardPanel
         mapRef={mapRef}
         open={dashOpen}
-        onClose={() => setDashOpen(false)}
+        onClose={() => { mapRef.current?.clearStatsLayer(); setDashOpen(false) }}
         onSelect={() => setModalOpen(false)}
         onAnalyze={async (code) => {
           setCarCode(code)

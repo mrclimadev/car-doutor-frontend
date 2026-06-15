@@ -268,16 +268,20 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
       showPropertyOnMap(geometry)
       placeLaudoMarker(laudo, geometry)
       if (laudo?.car_code) fetchSicarLayers(laudo.car_code)
-      // Troca spotlight e scan-bbox-outline para o contorno exato do polígono
+      // Troca spotlight para o contorno exato do polígono e reduz overlay
       const ring = geometryToRing(geometry)
       if (ring) {
         if (map.current.getLayer('spotlight')) {
           map.current.getSource(SPOTLIGHT_SRC)?.setData(makeSpotlightData(ring))
+          map.current.setPaintProperty('spotlight', 'fill-opacity', 0.42)
         }
+        // Contorno fino do polígono pós-análise
         map.current.getSource(SCAN_BBOX_SRC)?.setData({
           type: 'FeatureCollection',
           features: [{ type: 'Feature', geometry, properties: {} }],
         })
+        if (map.current.getLayer('scan-bbox-outline'))
+          map.current.setPaintProperty('scan-bbox-outline', 'line-opacity', 0.7)
       }
     },
     clearResult() {
@@ -347,22 +351,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
 
       // Spotlight: dark overlay com buraco no bbox
       map.current.getSource(SPOTLIGHT_SRC)?.setData(makeSpotlightData(bboxToHoleRing(bbox)))
-      map.current.setPaintProperty('spotlight', 'fill-opacity', 0.75)
-
-      map.current.getSource(SCAN_BBOX_SRC)?.setData({
-        type: 'FeatureCollection',
-        features: [{
-          type: 'Feature',
-          geometry: {
-            type: 'Polygon',
-            coordinates: [[
-              [minLng, minLat], [maxLng, minLat],
-              [maxLng, maxLat], [minLng, maxLat],
-              [minLng, minLat],
-            ]],
-          },
-        }],
-      })
+      map.current.setPaintProperty('spotlight', 'fill-opacity', 0.52)
 
       if (scanRafRef.current) cancelAnimationFrame(scanRafRef.current)
       scanStartRef.current = performance.now()
@@ -372,7 +361,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
         const [bMinLng, bMinLat, bMaxLng, bMaxLat] = scanBboxRef.current
         const elapsed = ts - scanStartRef.current
 
-        const sweepT = (elapsed % 3000) / 3000
+        const sweepT = (elapsed % 2800) / 2800
         const sweepLat = bMaxLat - sweepT * (bMaxLat - bMinLat)
         map.current.getSource(SCAN_LINE_SRC)?.setData({
           type: 'FeatureCollection',
@@ -381,10 +370,6 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
             coordinates: [[bMinLng, sweepLat], [bMaxLng, sweepLat]],
           }}],
         })
-
-        const bboxOpacity = 0.4 + 0.4 * Math.sin(elapsed / 600)
-        if (map.current.getLayer('scan-bbox-outline'))
-          map.current.setPaintProperty('scan-bbox-outline', 'line-opacity', bboxOpacity)
 
         scanRafRef.current = requestAnimationFrame(rafAnimate)
       }
@@ -434,11 +419,11 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
       const empty = { type: 'FeatureCollection', features: [] }
       map.current.getSource(SCAN_BBOX_SRC)?.setData(empty)
       map.current.getSource(SCAN_LINE_SRC)?.setData(empty)
+      if (map.current.getLayer('scan-bbox-outline'))
+        map.current.setPaintProperty('scan-bbox-outline', 'line-opacity', 0)
       scanMarkersRef.current.forEach(m => m.remove())
       scanMarkersRef.current = []
-      // Limpa spotlight imediatamente, sem fade
-      const emptySpot = { type: 'FeatureCollection', features: [] }
-      map.current.getSource(SPOTLIGHT_SRC)?.setData(emptySpot)
+      map.current.getSource(SPOTLIGHT_SRC)?.setData({ type: 'FeatureCollection', features: [] })
       if (map.current.getLayer('spotlight'))
         map.current.setPaintProperty('spotlight', 'fill-opacity', 0)
     },
@@ -591,7 +576,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
         type: 'fill',
         source: SPOTLIGHT_SRC,
         paint: {
-          'fill-color': '#030f03',
+          'fill-color': '#010a01',
           'fill-opacity': 0,
         },
       })
@@ -601,10 +586,9 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
         type: 'line',
         source: SCAN_BBOX_SRC,
         paint: {
-          'line-color': '#00ffaa',
-          'line-width': 2.5,
-          'line-opacity': 1,
-          'line-dasharray': [8, 4],
+          'line-color': '#4ecb71',
+          'line-width': 1.5,
+          'line-opacity': 0,
         },
       })
       map.current.addSource(SCAN_LINE_SRC, { type: 'geojson', data: scanEmpty })
@@ -612,7 +596,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
         id: 'scan-sweep',
         type: 'line',
         source: SCAN_LINE_SRC,
-        paint: { 'line-color': '#00ffaa', 'line-width': 2, 'line-opacity': 0.9 },
+        paint: { 'line-color': '#4ecb71', 'line-width': 1, 'line-opacity': 0.5 },
       })
     })
 
@@ -705,7 +689,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
 
       const btnHtml = car ? `
         <button
-          onclick="window.__carDoutorImovelData && window.__carDoutorImovelData('${car}');this.closest('.maplibregl-popup').remove();"
+          onclick="window.__greenCarImovelData && window.__greenCarImovelData('${car}');this.closest('.maplibregl-popup').remove();"
           style="
             margin-top:10px;width:100%;padding:6px 0;
             background:#0d2a0d;color:#4ecb71;border:1px solid #2d6e2d;border-radius:6px;
@@ -715,7 +699,7 @@ export default forwardRef(function MapView({ onPolygonDrawn, drawingMode }, ref)
           onmouseout="this.style.background='#0d2a0d'"
         >📋 Ver dados do imóvel</button>
         <button
-          onclick="window.__carDoutorAnalyze && window.__carDoutorAnalyze('${car}',${e.lngLat.lng},${e.lngLat.lat});this.closest('.maplibregl-popup').remove();"
+          onclick="window.__greenCarAnalyze && window.__greenCarAnalyze('${car}',${e.lngLat.lng},${e.lngLat.lat});this.closest('.maplibregl-popup').remove();"
           style="
             margin-top:5px;width:100%;padding:6px 0;
             background:#1b6e1b;color:#fff;border:none;border-radius:6px;

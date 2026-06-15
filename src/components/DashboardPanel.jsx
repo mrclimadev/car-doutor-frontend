@@ -35,7 +35,13 @@ function munFromProps(p) {
   return p?.municipio || p?.nm_municip || p?.nm_mun || p?.municipio_ || '—'
 }
 
+const ESTADOS = [
+  { uf: 'MT', label: 'Mato Grosso' },
+  { uf: 'DF', label: 'Distrito Federal' },
+]
+
 export default function DashboardPanel({ mapRef, open, onClose, onSelect, onAnalyze }) {
+  const [uf, setUf]                 = useState('MT')
   const [stats, setStats]           = useState(null)
   const [loading, setLoading]       = useState(false)
   const [activeFilter, setActive]   = useState(null)
@@ -111,14 +117,23 @@ export default function DashboardPanel({ mapRef, open, onClose, onSelect, onAnal
 
   // ── Load stats ────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!open || stats) return
+    if (!open) return
+    setStats(null)
+    setActive(null)
+    setImoveis([])
+    setFeatures([])
+    setTotal(0)
+    setSearch('')
+    setSelected(null)
+    setTab('condicao')
+    mapRef.current?.clearStatsLayer()
     setLoading(true)
-    fetch(`${API_BASE}/stats`)
+    fetch(`${API_BASE}/stats?uf=${uf}`)
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(e => console.error('Dashboard stats error:', e))
       .finally(() => setLoading(false))
-  }, [open, stats])
+  }, [open, uf])
 
   // ── Load filter ───────────────────────────────────────────────────────────
   const loadFilter = useCallback(async (type, value) => {
@@ -143,7 +158,7 @@ export default function DashboardPanel({ mapRef, open, onClose, onSelect, onAnal
       ? `condic=${encodeURIComponent(value)}`
       : `municipio=${encodeURIComponent(value)}`
     try {
-      const res = await fetch(`${API_BASE}/stats/map?${param}&limit=1000`)
+      const res = await fetch(`${API_BASE}/stats/map?${param}&uf=${uf}&limit=1000`)
       const fc  = await res.json()
       mapRef.current?.showStatsLayer(fc)
       const feats = (fc.features || []).filter(f => f.properties?.cod_imovel)
@@ -157,7 +172,7 @@ export default function DashboardPanel({ mapRef, open, onClose, onSelect, onAnal
     } finally {
       setLoadingMap(false)
     }
-  }, [activeFilter, mapRef, onSelect])
+  }, [activeFilter, mapRef, onSelect, uf])
 
   function handleClearFilter() {
     setActive(null)
@@ -212,10 +227,28 @@ export default function DashboardPanel({ mapRef, open, onClose, onSelect, onAnal
           <span className="dash-hd-icon">📊</span>
           <div>
             <div className="dash-title">Painel Analítico</div>
-            {!minimized && <div className="dash-subtitle">Cadastros SICAR · Mato Grosso</div>}
+            {!minimized && (
+              <div className="dash-subtitle">
+                Cadastros SICAR · {ESTADOS.find(e => e.uf === uf)?.label ?? uf}
+              </div>
+            )}
           </div>
         </div>
         <div className="dash-hd-actions">
+          {!minimized && (
+            <div className="dash-uf-selector" onClick={e => e.stopPropagation()}>
+              {ESTADOS.map(e => (
+                <button
+                  key={e.uf}
+                  className={`dash-uf-btn ${uf === e.uf ? 'active' : ''}`}
+                  onClick={() => setUf(e.uf)}
+                  title={e.label}
+                >
+                  {e.uf}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             className="dash-minimize"
             onClick={() => setMinimized(m => !m)}

@@ -32,7 +32,7 @@ function buildWhatsAppText(laudo) {
     .trim()
 
   return [
-    `*CAR Doutor — Análise do Imóvel*`,
+    `*Green Car — Análise do Imóvel*`,
     '',
     `${E.pin} *${laudo.municipio || 'Mato Grosso'} · MT*`,
     `Área: *${(laudo.area_imovel_ha || 0).toFixed(0)} ha*`,
@@ -52,7 +52,7 @@ function buildWhatsAppText(laudo) {
       ? `${E.bullet} ${laudo.total_pendencias} pendência${laudo.total_pendencias > 1 ? 's' : ''} identificada${laudo.total_pendencias > 1 ? 's' : ''}`
       : `${E.check} Nenhuma pendência encontrada`,
     '',
-    '_Análise automática — CAR Doutor (ENAP Hackathon 2026)_',
+    '_Análise automática — Green Car (ENAP Hackathon 2026)_',
     '_Não substitui laudo técnico assinado por profissional habilitado._',
   ].filter(p => p !== null).join('\n')
 }
@@ -175,7 +175,7 @@ function exportPDF(laudo) {
   doc.setTextColor(78, 203, 78)
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(16)
-  doc.text('CAR Doutor', mg, 15)
+  doc.text('Green Car', mg, 15)
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(8.5)
   doc.setTextColor(130, 190, 130)
@@ -398,7 +398,7 @@ function exportPDF(laudo) {
     doc.setFontSize(7.5)
     doc.setFont('helvetica', 'normal')
     doc.setTextColor(...mutedTxt)
-    doc.text('CAR Doutor — Analise Automatica do Cadastro Ambiental Rural — ENAP Hackathon 2026', mg, 292)
+    doc.text('Green Car — Analise Automatica do Cadastro Ambiental Rural — ENAP Hackathon 2026', mg, 292)
     doc.text(`Pagina ${i} de ${pages}`, W - mg, 292, { align: 'right' })
   }
 
